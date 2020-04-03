@@ -23,6 +23,7 @@ import (
 	"io"
 	"net/http"
 	"path"
+	"sync"
 
 	xhttp "github.com/minio/minio/cmd/http"
 	"github.com/minio/minio/cmd/logger"
@@ -294,7 +295,13 @@ func (xl xlObjects) getObject(ctx context.Context, bucket, object string, startO
 		// we return from this function.
 		closeBitrotReaders(readers)
 		if err != nil {
-			return toObjectErr(err, bucket, object)
+			if decodeHealErr, ok := err.(*errDecodeHealRequired); ok {
+				go deepHealObject(pathJoin(bucket, object))
+				err = decodeHealErr.err
+			}
+			if err != nil {
+				return toObjectErr(err, bucket, object)
+			}
 		}
 		for i, r := range readers {
 			if r == nil {
@@ -339,7 +346,7 @@ func (xl xlObjects) getObjectInfoDir(ctx context.Context, bucket, object string)
 		}, index)
 	}
 
-	readQuorum := len(storageDisks) / 2
+	readQuorum := getReadQuorum(len(storageDisks))
 	err := reduceReadQuorumErrs(ctx, g.Wait(), objectOpIgnoredErrs, readQuorum)
 	return dirObjectInfo(bucket, object, 0, map[string]string{}), err
 }
@@ -487,7 +494,7 @@ func (xl xlObjects) putObject(ctx context.Context, bucket string, object string,
 	// Get parity and data drive count based on storage class metadata
 	parityDrives := globalStorageClass.GetParityForSC(opts.UserDefined[xhttp.AmzStorageClass])
 	if parityDrives == 0 {
-		parityDrives = len(storageDisks) / 2
+		parityDrives = getDefaultParityBlocks(len(storageDisks))
 	}
 	dataDrives := len(storageDisks) - parityDrives
 
@@ -781,18 +788,25 @@ func (xl xlObjects) doDeleteObjects(ctx context.Context, bucket string, objects 
 	// Initialize list of errors.
 	var opErrs = make([]error, len(disks))
 	var delObjErrs = make([][]error, len(disks))
+	var wg = sync.WaitGroup{}
 
 	// Remove objects in bulk for each disk
-	for index, disk := range disks {
-		if disk == nil {
-			opErrs[index] = errDiskNotFound
+	for i, d := range disks {
+		if d == nil {
+			opErrs[i] = errDiskNotFound
 			continue
 		}
-		delObjErrs[index], opErrs[index] = cleanupObjectsBulk(disk, minioMetaTmpBucket, tmpObjs, errs)
-		if opErrs[index] == errVolumeNotFound || opErrs[index] == errFileNotFound {
-			opErrs[index] = nil
-		}
+		wg.Add(1)
+		go func(index int, disk StorageAPI) {
+			defer wg.Done()
+			delObjErrs[index], opErrs[index] = disk.DeletePrefixes(minioMetaTmpBucket, tmpObjs)
+			if opErrs[index] == errVolumeNotFound || opErrs[index] == errFileNotFound {
+				opErrs[index] = nil
+			}
+		}(i, d)
 	}
+
+	wg.Wait()
 
 	// Return errors if any during deletion
 	if err := reduceWriteQuorumErrs(ctx, opErrs, objectOpIgnoredErrs, len(disks)/2+1); err != nil {
@@ -805,9 +819,14 @@ func (xl xlObjects) doDeleteObjects(ctx context.Context, bucket string, objects 
 			continue
 		}
 		listErrs := make([]error, len(disks))
+		// Iterate over disks to fetch the error
+		// of deleting of the current object
 		for i := range delObjErrs {
+			// delObjErrs[i] is not nil when disks[i] is also not nil
 			if delObjErrs[i] != nil {
-				listErrs[i] = delObjErrs[i][objIndex]
+				if delObjErrs[i][objIndex] != errFileNotFound {
+					listErrs[i] = delObjErrs[i][objIndex]
+				}
 			}
 		}
 		errs[objIndex] = reduceWriteQuorumErrs(ctx, listErrs, objectOpIgnoredErrs, writeQuorums[objIndex])
@@ -829,11 +848,13 @@ func (xl xlObjects) deleteObjects(ctx context.Context, bucket string, objects []
 		isObjectDirs[i] = HasSuffix(object, SlashSeparator)
 	}
 
+	storageDisks := xl.getDisks()
+
 	for i, object := range objects {
 		if isObjectDirs[i] {
 			_, err := xl.getObjectInfoDir(ctx, bucket, object)
 			if err == errXLReadQuorum {
-				if isObjectDirDangling(statAllDirs(ctx, xl.getDisks(), bucket, object)) {
+				if isObjectDirDangling(statAllDirs(ctx, storageDisks, bucket, object)) {
 					// If object is indeed dangling, purge it.
 					errs[i] = nil
 				}
@@ -855,7 +876,7 @@ func (xl xlObjects) deleteObjects(ctx context.Context, bucket string, objects []
 		// class for objects which have reduced quorum
 		// storage class only needs to be honored for
 		// Read() requests alone which we already do.
-		writeQuorums[i] = len(xl.getDisks())/2 + 1
+		writeQuorums[i] = getWriteQuorum(len(storageDisks))
 	}
 
 	return xl.doDeleteObjects(ctx, bucket, objects, errs, writeQuorums, isObjectDirs)
@@ -921,10 +942,12 @@ func (xl xlObjects) DeleteObject(ctx context.Context, bucket, object string) (er
 	var writeQuorum int
 	var isObjectDir = HasSuffix(object, SlashSeparator)
 
+	storageDisks := xl.getDisks()
+
 	if isObjectDir {
 		_, err = xl.getObjectInfoDir(ctx, bucket, object)
 		if err == errXLReadQuorum {
-			if isObjectDirDangling(statAllDirs(ctx, xl.getDisks(), bucket, object)) {
+			if isObjectDirDangling(statAllDirs(ctx, storageDisks, bucket, object)) {
 				// If object is indeed dangling, purge it.
 				err = nil
 			}
@@ -935,10 +958,10 @@ func (xl xlObjects) DeleteObject(ctx context.Context, bucket, object string) (er
 	}
 
 	if isObjectDir {
-		writeQuorum = len(xl.getDisks())/2 + 1
+		writeQuorum = getWriteQuorum(len(storageDisks))
 	} else {
 		// Read metadata associated with the object from all disks.
-		partsMetadata, errs := readAllXLMetadata(ctx, xl.getDisks(), bucket, object)
+		partsMetadata, errs := readAllXLMetadata(ctx, storageDisks, bucket, object)
 		// get Quorum for this object
 		_, writeQuorum, err = objectQuorumFromMeta(ctx, xl, partsMetadata, errs)
 		if err != nil {

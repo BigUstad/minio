@@ -17,7 +17,6 @@
 package json
 
 import (
-	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,6 +26,7 @@ import (
 	"strings"
 
 	"github.com/bcicen/jstream"
+	csv "github.com/minio/minio/pkg/csvparser"
 	"github.com/minio/minio/pkg/s3select/sql"
 )
 
@@ -108,7 +108,7 @@ func (r *Record) Set(name string, value *sql.Value) (sql.Record, error) {
 }
 
 // WriteCSV - encodes to CSV data.
-func (r *Record) WriteCSV(writer io.Writer, fieldDelimiter rune) error {
+func (r *Record) WriteCSV(writer io.Writer, opts sql.WriteCSVOpts) error {
 	var csvRecord []string
 	for _, kv := range r.KVS {
 		var columnValue string
@@ -136,7 +136,10 @@ func (r *Record) WriteCSV(writer io.Writer, fieldDelimiter rune) error {
 	}
 
 	w := csv.NewWriter(writer)
-	w.Comma = fieldDelimiter
+	w.Comma = opts.FieldDelimiter
+	w.Quote = opts.Quote
+	w.AlwaysQuote = opts.AlwaysQuote
+	w.QuoteEscape = opts.QuoteEscape
 	if err := w.Write(csvRecord); err != nil {
 		return err
 	}

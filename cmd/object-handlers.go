@@ -657,7 +657,7 @@ var getRemoteInstanceClient = func(r *http.Request, host string) (*miniogo.Core,
 	if err != nil {
 		return nil, err
 	}
-	core.SetCustomTransport(NewCustomHTTPTransport())
+	core.SetCustomTransport(NewGatewayHTTPTransport())
 	return core, nil
 }
 
@@ -1217,8 +1217,7 @@ func (api objectAPIHandlers) PutObjectHandler(w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	var tags string
-	if tags = r.Header.Get(http.CanonicalHeaderKey(xhttp.AmzObjectTagging)); tags != "" {
+	if tags := r.Header.Get(xhttp.AmzObjectTagging); tags != "" {
 		if !objectAPI.IsObjectTaggingSupported() {
 			writeErrorResponse(ctx, w, errorCodes.ToAPIErr(ErrNotImplemented), r.URL, guessIsBrowserReq(r))
 			return
@@ -3002,5 +3001,5 @@ func (api objectAPIHandlers) DeleteObjectTaggingHandler(w http.ResponseWriter, r
 		return
 	}
 
-	writeSuccessResponseHeadersOnly(w)
+	writeSuccessNoContent(w)
 }
