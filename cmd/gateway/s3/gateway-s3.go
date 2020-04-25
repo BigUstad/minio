@@ -242,8 +242,8 @@ func (g *S3) NewGatewayLayer(creds auth.Credentials) (minio.ObjectLayer, error) 
 		encS := s3EncObjects{s}
 
 		// Start stale enc multipart uploads cleanup routine.
-		go encS.cleanupStaleEncMultipartUploads(context.Background(),
-			minio.GlobalMultipartCleanupInterval, minio.GlobalMultipartExpiry, minio.GlobalServiceDoneCh)
+		go encS.cleanupStaleEncMultipartUploads(minio.GlobalContext,
+			minio.GlobalMultipartCleanupInterval, minio.GlobalMultipartExpiry)
 
 		return &encS, nil
 	}
@@ -402,7 +402,7 @@ func (l *s3Objects) GetObjectNInfo(ctx context.Context, bucket, object string, r
 	// Setup cleanup function to cause the above go-routine to
 	// exit in case of partial read
 	pipeCloser := func() { pr.Close() }
-	return minio.NewGetObjectReaderFromReader(pr, objInfo, opts.CheckCopyPrecondFn, pipeCloser)
+	return minio.NewGetObjectReaderFromReader(pr, objInfo, opts, pipeCloser)
 }
 
 // GetObject reads an object from S3. Supports additional
@@ -453,14 +453,7 @@ func (l *s3Objects) GetObjectInfo(ctx context.Context, bucket string, object str
 func (l *s3Objects) PutObject(ctx context.Context, bucket string, object string, r *minio.PutObjReader, opts minio.ObjectOptions) (objInfo minio.ObjectInfo, err error) {
 	data := r.Reader
 
-	var tagMap map[string]string
-	tags, ok := opts.UserDefined["X-Amz-Tagging"]
-	if ok {
-		taggingObj, _ := tagging.FromString(tags)
-		tagMap = tagging.ToMap(taggingObj)
-		delete(opts.UserDefined, "X-Amz-Tagging")
-	}
-	oi, err := l.Client.PutObject(bucket, object, data, data.Size(), data.MD5Base64String(), data.SHA256HexString(), minio.ToMinioClientMetadata(opts.UserDefined), opts.ServerSideEncryption, tagMap)
+	oi, err := l.Client.PutObject(bucket, object, data, data.Size(), data.MD5Base64String(), data.SHA256HexString(), minio.ToMinioClientMetadata(opts.UserDefined), opts.ServerSideEncryption)
 	if err != nil {
 		return objInfo, minio.ErrorRespToObjectError(err, bucket, object)
 	}
@@ -482,11 +475,6 @@ func (l *s3Objects) CopyObject(ctx context.Context, srcBucket string, srcObject 
 	// So preserve it by adding "REPLACE" directive to save all the metadata set by CopyObject API.
 	srcInfo.UserDefined["x-amz-metadata-directive"] = "REPLACE"
 	srcInfo.UserDefined["x-amz-copy-source-if-match"] = srcInfo.ETag
-	// See comment above. Tags will be applied on destination object.
-	_, ok := srcInfo.UserDefined["X-Amz-Tagging"]
-	if ok {
-		srcInfo.UserDefined["x-amz-tagging-directive"] = "REPLACE"
-	}
 
 	header := make(http.Header)
 	if srcOpts.ServerSideEncryption != nil {
@@ -499,7 +487,6 @@ func (l *s3Objects) CopyObject(ctx context.Context, srcBucket string, srcObject 
 	for k, v := range header {
 		srcInfo.UserDefined[k] = v[0]
 	}
-
 	if _, err = l.Client.CopyObject(srcBucket, srcObject, dstBucket, dstObject, srcInfo.UserDefined); err != nil {
 		return objInfo, minio.ErrorRespToObjectError(err, srcBucket, srcObject)
 	}
